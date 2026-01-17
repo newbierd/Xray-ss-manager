@@ -1,8 +1,49 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Xray + Shadowsocks/SS2022 管理脚本（安装 / 卸载 / 无人值守）
-#  注意：Bash 不支持中文变量名/函数名，本脚本使用 ASCII 标识符，
-#       但所有注释与提示仍保持中文。
+# ============================================================
+# 功能概述：
+#  1) 交互式菜单：可选择安装或卸载
+#  2) 安装：自动安装 Xray、创建/追加 inbound、安装 systemd/OpenRC 服务
+#  3) 安装完成：同时输出两种 ss:// 分享链接（类型1/类型2），并保存到 /root/xray_ss_link.txt
+#  4) 卸载：停止并移除 systemd/OpenRC 服务、备份并删除配置与二进制、可选彻底清理用户组
+#  5) 无人值守：支持完全不交互批量部署（--non-interactive / -n）
+#
+# 默认行为（安装）：
+#  - 默认端口：40000（可用 -p/--port 指定）
+#  - 默认协议：ss2022
+#  - 默认加密：2022-blake3-chacha20-poly1305（32 字节密钥）
+#  - 默认密码：若未指定则自动生成随机 Base64（32 字节）
+#  - 默认分享地址：若未指定域名/IP，则自动探测公网 IPv4（失败则用 <SERVER_IP>）
+#  - 默认分享标签(tag)：若未指定则为 xray-<协议>（例如 xray-ss2022）
+#
+# 参数说明：
+#  动作：
+#    install | --install | -i               执行安装/追加入站
+#    uninstall | --uninstall | -u           执行卸载
+#
+#  卸载可选：
+#    --purge                                卸载同时尝试删除 xray 用户与组（默认保留）
+#
+#  安装可选（交互/无人值守均可用）：
+#    -n | --non-interactive                 无人值守（不询问，直接使用默认值或参数值）
+#    -p <端口> | --port <端口>              指定端口（默认 40000；无人值守建议用 -p 指定）
+#    -d <域名或IP> | --domain <域名或IP>    指定写入分享链接的域名/IP（不影响实际监听）
+#    --password <密码>                      指定密码（建议传 Base64；脚本不做格式校验）
+#    -t <标签> | --tag <标签>               指定输出分享链接的 tag（# 后的备注；不影响服务端配置）
+#
+# 分享链接输出说明：
+#  安装完成后会同时输出两条 ss:// 链接，并写入 /root/xray_ss_link.txt：
+#   - 类型1：明文 method + URL 编码 password
+#     ss://method:URLEncoded(password)@host:port#tag
+#   - 类型2：SIP002 Base64（更通用）
+#     ss://BASE64(method:password@host:port)#tag
+#
+# 重要路径：
+#  - 二进制：/usr/local/bin/xray
+#  - 配置： /usr/local/etc/xray/config.json
+#  - 卸载备份：/root/xray-config-backup-<时间>.tar.gz
+#  - 分享链接记录：/root/xray_ss_link.txt
 # ============================================================
 
 set -euo pipefail
@@ -188,6 +229,7 @@ install_xray() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
+  # 修复点：在 set -u 下，trap 引用变量必须做防御；同时仅在目录存在时删除
   trap 'if [[ -n "${tmpdir:-}" && -d "${tmpdir:-}" ]]; then rm -rf "$tmpdir"; fi' EXIT
 
   local zipname="Xray-linux-${arch}.zip"
@@ -266,6 +308,28 @@ select_protocol_and_method() {
   fi
 
   info "最终选择：协议=${PROTOCOL}，加密=${METHOD}"
+}
+
+# 新增：交互式安装过程中引导指定分享 tag（仅影响链接 #tag，不影响服务端）
+prompt_share_tag_interactive() {
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    return 0
+  fi
+  if [[ -n "${SHARE_TAG:-}" ]]; then
+    return 0
+  fi
+
+  local default_tag="xray-${PROTOCOL:-ss2022}"
+  local input
+
+  echo
+  echo "================ 分享链接标签（tag）设置 ================"
+  echo "说明：tag 仅用于分享链接中的 #tag 备注，不影响服务端监听与配置。"
+  read -rp "请输入分享链接的 tag（默认：${default_tag}）： " input || true
+  input="$(echo -n "${input:-}" | awk '{$1=$1;print}')"
+  SHARE_TAG="${input:-$default_tag}"
+
+  info "将使用分享链接 tag：${SHARE_TAG}"
 }
 
 generate_or_read_password() {
@@ -472,11 +536,8 @@ determine_server_addr() {
 }
 
 print_links_and_save() {
-  # tag 优先级：-t/--tag > 默认 xray-<协议>
-  local tag_raw
-  tag_raw="${SHARE_TAG:-xray-${PROTOCOL:-ss2022}}"
+  local tag_raw="${SHARE_TAG:-xray-${PROTOCOL:-ss2022}}"
 
-  # URL 编码 password 与 tag
   local enc_pw tag_enc
   enc_pw="$(python3 - <<'PY'
 import urllib.parse, os
@@ -489,10 +550,8 @@ print(urllib.parse.quote(os.environ.get("TAG","xray-ss2022"), safe=''))
 PY
 )"
 
-  # 类型1：明文 method + URL 编码 password
   local uri_plain="ss://${METHOD}:${enc_pw}@${SERVER_ADDR}:${IN_PORT}#${tag_enc}"
 
-  # 类型2：SIP002 Base64（URL-safe base64 + 去掉 '='）
   local b64_userinfo
   b64_userinfo="$(python3 - <<'PY'
 import base64, os
@@ -550,6 +609,7 @@ run_install() {
   select_port
   install_xray
   select_protocol_and_method
+  prompt_share_tag_interactive
   generate_or_read_password
   backup_config_if_exists
   generate_unique_inbound_tag
