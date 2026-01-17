@@ -188,7 +188,7 @@ install_xray() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir" >/dev/null 2>&1 || true' EXIT
+  trap 'if [[ -n "${tmpdir:-}" && -d "${tmpdir:-}" ]]; then rm -rf "$tmpdir"; fi' EXIT
 
   local zipname="Xray-linux-${arch}.zip"
   local url_main="https://github.com/XTLS/Xray-core/releases/latest/download/${zipname}"
